@@ -100,16 +100,35 @@ MSA, Kafka, Kubernetes 등의 기술 자체를 사용하는 것이 목표가 아
 
 초기 목표이며 실제 테스트 환경과 결과에 따라 합리적으로 조정할 수 있다.
 
-| 지표 | 초기 목표 |
-|---|---:|
-| Availability | 99.9% 이상 |
-| HTTP 5xx Rate | 1% 미만 |
-| API p95 Latency | 300ms 이하 |
-| 중복 이벤트 처리 | 0건 |
-| 장애 탐지 시간 | 1분 이내 |
-| Peak Load | 최소 3,000 RPS 검증 |
-| API Auto Scaling | HPA 정상 동작 |
-| Worker Auto Scaling | Kafka Lag 기반 KEDA 정상 동작 |
+| 지표 | 초기 목표 | 측정 범위 |
+|---|---:|---|
+| Availability | 99.9% 이상 | 유효 요청 중 서버가 정상 처리한 요청 비율 |
+| HTTP 5xx Rate | 0.1% 이하 | 전체 유효 요청 중 5xx 응답 비율 |
+| Read API p95 Latency | 300ms 이하 | Event 목록 / 상세 / Ranking |
+| Write API 접수 p95 Latency | 500ms 이하 | Vote 및 동기·비동기 Claim 접수 |
+| 비동기 Claim 완료 p95 | 5초 이하 | `createdAt`부터 `processedAt`까지 |
+| 중복 Vote / Claim | 0건 | 최종 Database 상태 기준 |
+| Claim 수량 초과 처리 | 0건 | 성공 Claim 수가 설정 수량을 초과하지 않음 |
+| 장애 탐지 시간 | 1분 이내 | 장애 발생부터 Alert firing까지 |
+| Peak Load | 최소 3,000 RPS 검증 | 정의된 혼합 트래픽과 테스트 환경 기준 |
+| API Auto Scaling | HPA 정상 동작 | 부하 증가·감소 시 Scale Out/In 확인 |
+| Worker Auto Scaling | Kafka Lag 기반 KEDA 정상 동작 | Lag 증가·회복 과정 확인 |
+
+Availability와 5xx Rate는 동일한 유효 요청 집합을 기준으로 측정한다. Validation 실패, 존재하지 않는 리소스 조회, 중복 요청과 수량 소진으로 인한 예상된 4xx 응답은 서버 장애로 계산하지 않되 별도 비즈니스 지표로 기록한다.
+
+모든 결과에는 다음 정보를 함께 기록한다.
+
+```text
+Git Commit / Image Digest
+테스트 환경(Local k3d 또는 AWS EKS)
+Pod / Node / DB / Redis / Kafka Resource
+Seed Data 규모
+API별 Traffic Mix
+테스트 시간과 Warm-up 시간
+k6 실행 장비의 CPU / Memory / Network 사용률
+```
+
+Local과 AWS 결과를 같은 표에서 직접 비교하지 않는다. 짧은 부하 테스트 결과를 월간 운영 SLO 달성으로 표현하지 않고, **해당 테스트 구간에서의 SLO 적합 여부**로 기록한다.
 
 수치 자체보다 **개선 전후의 변화와 그 원인을 설명할 수 있는 것**을 더 중요하게 평가한다.
 
@@ -150,7 +169,13 @@ MSA, Kafka, Kubernetes 등의 기술 자체를 사용하는 것이 목표가 아
 
 회원 인증 시스템 구현에 과도한 시간을 사용하지 않는다.
 
-초기에는 테스트용 사용자 식별자를 Request Body 또는 Header로 전달한다.
+초기에는 모든 참여 API에서 다음 테스트용 Header로 사용자를 식별한다.
+
+```http
+X-Test-User-Id: 1001
+```
+
+`X-Test-User-Id`는 Local 및 부하 테스트 전용이며 신뢰 가능한 인증 수단이 아니다. 외부에 공개하는 운영 환경에서는 비활성화해야 한다. 이 프로젝트의 중복 Vote / Claim 방지는 **주어진 사용자 식별자에 대한 정합성 보장**이며, 사용자 인증이나 Header 위조 방지를 구현했다고 주장하지 않는다.
 
 ---
 
@@ -211,20 +236,37 @@ GET /api/v1/events/{eventId}
 
 ```http
 POST /api/v1/events/{eventId}/votes
+X-Test-User-Id: 1001
 ```
 
 예시:
 
 ```json
 {
-  "userId": 1001,
   "candidateId": 3
 }
 ```
 
 동일 사용자는 같은 이벤트에서 중복 투표할 수 없다.
 
+투표는 다음 조건을 모두 만족해야 한다.
+
+```text
+Event가 현재 OPEN 상태
+Candidate가 존재함
+Candidate가 요청한 Event에 속함
+userId와 candidateId가 양수
+동일 Event에 대한 기존 Vote가 없음
+```
+
 Database Unique Constraint를 최종 방어선으로 사용한다.
+
+```text
+UNIQUE (event_id, user_id)
+FOREIGN KEY (candidate_id) REFERENCES candidates(id)
+```
+
+중복 투표는 `409 Conflict`, 존재하지 않는 Event 또는 Candidate는 `404 Not Found`, 닫힌 Event는 `409 Conflict`로 응답한다. 동시에 같은 사용자의 요청이 도착하더라도 최종 Database에는 하나의 Vote만 존재해야 한다.
 
 ---
 
@@ -232,25 +274,53 @@ Database Unique Constraint를 최종 방어선으로 사용한다.
 
 ```http
 POST /api/v1/events/{eventId}/claims
+X-Test-User-Id: 1001
 ```
 
-예시:
-
-```json
-{
-  "userId": 1001
-}
-```
+Claim 요청은 Body를 사용하지 않는다.
 
 동일 사용자는 같은 이벤트를 중복 Claim할 수 없다.
 
-향후 다음 Header 사용을 검토한다.
+Claim은 이벤트별로 설정된 한정 수량 안에서 참여 권리를 확보하는 기능이다. 단순 중복 방지뿐 아니라 전체 성공 수량이 `totalQuantity`를 넘지 않아야 한다.
+
+```text
+EventInventory
+
+eventId
+totalQuantity
+claimedQuantity
+updatedAt
+```
+
+수량 확보는 Application의 조회 후 저장 방식으로 처리하지 않는다. 다음과 같은 조건부 갱신 또는 동등한 원자적 연산을 사용한다.
+
+```sql
+UPDATE event_inventory
+SET claimed_quantity = claimed_quantity + 1,
+    updated_at = CURRENT_TIMESTAMP
+WHERE event_id = :eventId
+  AND claimed_quantity < total_quantity;
+```
+
+영향받은 Row가 1개이면 수량 확보 성공, 0개이면 수량 소진으로 판단한다. 동일 Transaction 안에서 Claim 상태를 변경하며 `(event_id, user_id)` Unique Constraint를 최종 중복 방어선으로 유지한다.
+
+Phase 8의 비동기 Claim부터 다음 Header를 필수로 사용한다.
 
 ```http
 Idempotency-Key: <uuid>
 ```
 
+비동기 Claim을 도입하는 Phase 8부터 `Idempotency-Key`를 필수로 사용한다. 같은 Key와 같은 요청은 최초 결과를 반환하고, 같은 Key에 다른 `eventId` 또는 `userId`를 사용하면 `409 Conflict`로 처리한다. Redis가 없어도 Database Unique Constraint와 Claim 상태 전이로 최종 정합성을 보장해야 한다.
+
 초기에는 동기 방식으로 구현한다.
+
+동기 방식의 응답 계약:
+
+```text
+201 Created  Claim 성공
+404 Not Found  Event 없음
+409 Conflict  중복 Claim, 닫힌 Event 또는 수량 소진
+```
 
 향후 부하 테스트 결과에 따라 Kafka 기반 비동기 구조로 변경한다.
 
@@ -278,15 +348,79 @@ Claim Worker
 PostgreSQL
 ```
 
+비동기 방식의 응답 계약:
+
+```http
+POST /api/v1/events/{eventId}/claims
+X-Test-User-Id: 1001
+Idempotency-Key: <uuid>
+
+HTTP/1.1 202 Accepted
+Location: /api/v1/claims/{claimId}
+```
+
+```json
+{
+  "claimId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "PENDING"
+}
+```
+
+```http
+GET /api/v1/claims/{claimId}
+```
+
+Claim 상태는 다음 단방향 전이만 허용한다.
+
+```text
+PENDING → SUCCESS
+PENDING → FAILED
+```
+
+`FAILED`에는 최소한 `SOLD_OUT`, `EVENT_CLOSED`, `PROCESSING_ERROR` 사유를 기록한다. Kafka는 at-least-once 전달을 전제로 하며 Worker는 같은 `claimId`를 여러 번 받아도 결과가 바뀌지 않도록 멱등하게 처리한다.
+
+Phase 8에서는 Claim PENDING 저장과 Kafka 발행 사이의 Dual Write 문제를 피하기 위해 Transactional Outbox를 사용한다.
+
+```text
+Event API Transaction
+  ├ Claim(PENDING) 저장
+  └ Outbox Event 저장
+          ↓
+Outbox Publisher
+          ↓
+Kafka
+          ↓
+Claim Worker
+```
+
+API는 Claim과 Outbox Event가 함께 Commit된 뒤 `202 Accepted`를 반환한다. Outbox Publisher 장애 시 재시도할 수 있어야 하며, 처리 지연은 Claim 상태와 Outbox 적체 지표로 관측한다.
+
 ---
 
 # 9. Ranking
 
 ```http
-GET /api/v1/rankings
+GET /api/v1/events/{eventId}/rankings?limit=20
 ```
 
 Redis Sorted Set을 활용한 실시간 Ranking을 구현한다.
+
+PostgreSQL의 Vote를 최종 Source of Truth로 사용하고 Redis Ranking은 재생성 가능한 Projection으로 취급한다.
+
+```text
+Vote Database Commit
+ ↓ After Commit
+Redis ZINCRBY
+```
+
+Redis 갱신 실패 때문에 이미 Commit된 Vote를 실패로 응답하지 않는다. 실패한 갱신은 재시도하거나 Database 집계를 통해 Ranking을 재구축한다. 재구축 명령과 절차를 `docs/runbooks/`에 기록한다.
+
+동점은 다음 순서로 결정한다.
+
+```text
+score 내림차순
+candidateId 오름차순
+```
 
 초기에는 Event API 내부 Ranking Module로 구현한다.
 
@@ -476,6 +610,7 @@ presentation/
 이벤트 상태 관리
 이벤트 시작 / 종료 관리
 콘텐츠 카테고리 관리
+이벤트 후보 관리
 ```
 
 ## Vote
@@ -652,12 +787,21 @@ id
 title
 description
 category
-status
 startAt
 endAt
 createdAt
 updatedAt
 ```
+
+`status`는 별도 Database 컬럼으로 독립 관리하지 않고 조회 시점을 기준으로 `startAt`, `endAt`에서 계산한다.
+
+```text
+now < startAt                → SCHEDULED
+startAt <= now < endAt       → OPEN
+endAt <= now                 → CLOSED
+```
+
+모든 시간은 Database에 UTC `timestamptz`로 저장하고 API에서는 ISO-8601 offset 형식으로 반환한다. `startAt < endAt`을 반드시 검증한다.
 
 ### Category
 
@@ -674,6 +818,29 @@ MUSIC
 SCHEDULED
 OPEN
 CLOSED
+```
+
+초기 범위에는 관리자에 의한 강제 종료를 포함하지 않는다. 향후 필요할 경우 시간 기반 상태와 섞지 않고 별도의 `forcedClosedAt` 또는 명시적인 운영 상태 모델로 추가한다.
+
+---
+
+## Candidate
+
+```text
+id
+eventId
+name
+displayOrder
+createdAt
+```
+
+Candidate는 반드시 하나의 Event에 속한다. Vote 처리 시 URL의 `eventId`와 Candidate의 `eventId`가 동일해야 한다.
+
+Database Constraint:
+
+```text
+FOREIGN KEY (event_id) REFERENCES events(id)
+UNIQUE (event_id, name)
 ```
 
 ---
@@ -703,12 +870,14 @@ Database Constraint를 최종 정합성 보호 장치로 사용한다.
 ## Claim
 
 ```text
-id
+id (UUID)
 eventId
 userId
+idempotencyKey
 status
 createdAt
 processedAt
+failureReason
 ```
 
 Status:
@@ -723,6 +892,29 @@ Database Unique Constraint:
 
 ```text
 event_id + user_id
+idempotency_key
+```
+
+`idempotencyKey`는 Phase 8부터 저장하며 같은 Key가 다른 요청 내용에 재사용되지 않도록 요청 Fingerprint도 함께 비교한다.
+
+---
+
+## EventInventory
+
+```text
+eventId
+totalQuantity
+claimedQuantity
+updatedAt
+```
+
+Constraint:
+
+```text
+PRIMARY KEY / FOREIGN KEY (event_id) REFERENCES events(id)
+total_quantity >= 0
+claimed_quantity >= 0
+claimed_quantity <= total_quantity
 ```
 
 ---
@@ -742,6 +934,17 @@ PostgreSQL
  ↓
 Redis 저장
 ```
+
+Cache Key와 기본 TTL:
+
+```text
+event:{eventId}                TTL 60 seconds
+events:{queryHash}:{page}      TTL 30 seconds
+```
+
+Event가 변경되는 기능이 추가되면 Transaction Commit 이후 관련 Cache를 무효화한다. Cache는 Source of Truth가 아니므로 전체 삭제 후에도 Database에서 재구성할 수 있어야 한다.
+
+Redis 연결 실패는 Cache Miss와 구분한다. 짧은 연결·명령 Timeout을 적용하고 Redis 장애 시 PostgreSQL로 Fallback하되, DB 과부하 방지를 위해 요청 제한과 Alert를 적용한다. Redis 장애가 API Thread를 장시간 점유하지 않아야 한다.
 
 다음 항목을 관측한다.
 
@@ -764,6 +967,8 @@ Redis Sorted Set을 사용한다.
 ```text
 ranking:event:{eventId}
 ```
+
+Ranking Key는 TTL로 자동 삭제하지 않는다. Event 종료 후 보존 기간과 삭제 정책을 별도로 적용한다. Redis 데이터 유실 또는 정합성 불일치 시 PostgreSQL Vote 집계로 재구축한다.
 
 ---
 
@@ -823,6 +1028,33 @@ DB Transaction
 Queue Lag
 Worker Throughput
 ```
+
+Kafka 처리 계약:
+
+```text
+Delivery Semantics: at-least-once
+Message Key: claimId
+Producer Acks: all
+Worker Commit: Database Transaction 성공 후 Offset Commit
+Retry: 제한된 횟수와 Exponential Backoff
+DLQ: 재시도 소진 또는 처리 불가능한 Schema
+```
+
+Claim 메시지는 최소 다음 정보를 포함한다.
+
+```text
+eventId
+claimId
+userId
+idempotencyKey
+requestedAt
+schemaVersion
+correlationId
+```
+
+DLQ 메시지는 자동 폐기하지 않는다. 원인 수정 후 재처리하는 Runbook을 작성하며, DLQ 크기와 가장 오래된 메시지 시간을 Alert 대상으로 사용한다.
+
+여러 Partition을 사용하므로 모든 사용자에 대한 엄격한 전역 선착순 순서는 보장하지 않는다. 프로젝트의 Claim 성공 조건은 **수량을 초과하지 않는 것**과 **중복 성공이 없는 것**이다. 접수 순서까지 엄격히 보장해야 하는 요구가 추가되면 Partition 전략과 처리량의 Trade-off를 별도로 검증한다.
 
 ---
 
@@ -914,6 +1146,18 @@ Client / k6
 ```
 
 Ranking Service는 필요성이 실제로 검증된 경우에만 추가한다.
+
+이 AWS 구성의 검증 범위는 **Event API와 Claim Worker의 배포, 관측, 확장, 장애 복구 과정**이다. 비용 절감을 위해 PostgreSQL, Redis, Kafka를 단일 인스턴스 또는 Kubernetes 내부 Stateful Workload로 운영하는 경우 데이터 계층 자체의 Multi-AZ 고가용성을 검증했다고 주장하지 않는다.
+
+AWS 결과 문서에는 다음 한계를 명시한다.
+
+```text
+Application Layer HA 검증 여부
+Data Layer HA 미검증 또는 제한 사항
+부하 발생 위치와 Network 경로
+검증 시간
+실제 발생 비용
+```
 
 ---
 
@@ -1049,6 +1293,28 @@ Query Latency
 Slow Query
 ```
 
+## Observability 운영 원칙
+
+모든 HTTP 요청과 비동기 Claim 메시지에는 `correlationId`를 전달한다. Log에는 `correlationId`, `claimId`, `eventId`, 처리 단계와 실패 사유를 구조화하여 기록하고, 개인 식별이 가능한 값과 Secret은 기록하지 않는다.
+
+Prometheus Label에는 `userId`, `claimId`, `idempotencyKey`처럼 Cardinality가 계속 증가하는 값을 사용하지 않는다. 이 값들은 Trace 또는 Log 검색 필드로만 사용한다.
+
+최소 Alert:
+
+```text
+5xx Rate SLO 초과
+p95 Latency SLO 초과
+Pod Restart 증가
+Hikari Pending Connection 발생
+Redis Timeout 증가
+Kafka Consumer Lag 증가
+DLQ 메시지 발생
+Outbox Oldest Pending Age 증가
+Claim PROCESSING_ERROR 증가
+```
+
+Alert에는 원인 후보를 단정하지 않고 Dashboard와 Runbook Link를 포함한다. Phase 5에서 Alert가 실제 장애 주입 후 1분 이내 firing되는지 검증한다.
+
 ---
 
 # 24. SLI / SLO
@@ -1056,33 +1322,73 @@ Slow Query
 ## SLI
 
 ```text
-Availability
-Latency
-Error Rate
+Availability = 정상 처리된 유효 요청 수 / 전체 유효 요청 수
+
+HTTP 5xx Rate = 5xx 응답 수 / 전체 유효 요청 수
+
+Endpoint Latency = API별 Request Duration Histogram의 p95 / p99
+
+Claim Completion Latency = processedAt - createdAt
+
+Duplicate Rate = 중복 성공 Vote 또는 Claim 수
+
+Oversell Count = max(성공 Claim 수 - totalQuantity, 0)
 ```
+
+유효 요청은 인증 형식, 필수 Field, 리소스 식별자가 정상인 요청을 의미한다. 예상 가능한 `404`, 중복·소진에 대한 `409`, Validation `400`은 Availability 분모에서 제외하고 별도 지표로 기록한다. Timeout과 5xx는 실패로 계산한다.
 
 ## 초기 SLO
 
 ```text
-Availability >= 99.9%
+Test Window Availability >= 99.9%
 
-p95 Latency <= 300ms
+HTTP 5xx Rate <= 0.1%
 
-HTTP 5xx < 1%
+Read API p95 Latency <= 300ms
+
+Write API 접수 p95 Latency <= 500ms
+
+비동기 Claim Completion p95 <= 5s
+
+Duplicate Vote / Claim = 0
+
+Oversell Count = 0
 ```
 
-Grafana에서 별도 SLO Dashboard를 구성한다.
+Grafana에서 별도 SLO Dashboard를 구성하고 Test Run 시작·종료 Annotation을 남긴다. Availability 99.9%의 Error Budget은 해당 Test Window 유효 요청의 0.1%이다. 월간 SLO는 실제 장기 운영 데이터가 확보된 이후 별도로 정의한다.
 
 ---
 
 # 25. Load Test
 
-k6를 사용한다.
+k6를 사용한다. 처리량 목표가 있는 테스트는 `constant-arrival-rate` 또는 `ramping-arrival-rate` Executor를 사용하여 목표 RPS와 동시 사용자 수를 구분한다.
+
+기본 혼합 Traffic Profile:
+
+| API | 비율 | 데이터 전략 |
+|---|---:|---|
+| Event 목록 / 상세 | 70% | 여러 Event ID를 분산 조회 |
+| Vote | 20% | 중복되지 않는 userId를 기본으로 사용 |
+| Claim | 10% | 중복되지 않는 userId와 충분한 수량 사용 |
+
+중복, 수량 소진, 잘못된 Candidate를 검증하는 Negative Scenario는 정상 성능 시나리오와 분리한다. 각 테스트 전에 Seed Data와 Claim 수량을 초기화하고, 테스트 도중 생성된 데이터 규모를 기록한다.
+
+공통 사전 조건:
+
+```text
+동일 Git Commit / Image Digest 사용
+Pod와 Dependency Resource 고정 및 기록
+최소 2분 Warm-up 후 측정
+k6 CPU 70% 미만과 Dropped Iteration 확인
+NTP / Timezone 확인
+Dashboard Annotation 기록
+테스트 중 배포와 수동 설정 변경 금지
+```
 
 ## Baseline Test
 
 ```text
-100 RPS
+100 RPS / 10 minutes
 ```
 
 정상 환경 성능 기준을 확보한다.
@@ -1094,11 +1400,13 @@ k6를 사용한다.
 점진적으로 요청을 증가시킨다.
 
 ```text
-100
-500
-1,000
-2,000 RPS
+100 RPS   / 5 minutes
+500 RPS   / 5 minutes
+1,000 RPS / 5 minutes
+2,000 RPS / 5 minutes
 ```
+
+각 단계 사이에 부하를 100 RPS로 낮추어 회복 시간도 측정한다.
 
 ---
 
@@ -1107,10 +1415,14 @@ k6를 사용한다.
 이벤트 오픈 상황을 재현한다.
 
 ```text
-100 RPS
+100 RPS / 2 minutes
    ↓
-3,000+ RPS
+3,000+ RPS / 5 minutes
+   ↓
+100 RPS / 3 minutes
 ```
+
+Spike 구간의 성공률뿐 아니라 HPA 반응 지연, 최대 Pod 수, DB Connection, Redis Timeout, Kafka Lag과 정상 상태 복귀 시간을 기록한다.
 
 ---
 
@@ -1118,11 +1430,22 @@ k6를 사용한다.
 
 서비스가 어느 수준부터 성능이 급격하게 저하되는지 찾는다.
 
+500 RPS 단위로 증가시키되 다음 중 하나가 발생하면 중단한다.
+
+```text
+5xx Rate > 5%가 1분 이상 지속
+p95 > 2초가 1분 이상 지속
+DB 또는 Node가 복구되지 않는 포화 상태
+k6 Dropped Iteration 증가
+```
+
+중단 지점은 프로젝트 성능 수치가 아니라 해당 환경의 포화 지점으로 기록한다.
+
 ---
 
 ## Soak Test
 
-일정 트래픽을 장시간 유지한다.
+Baseline과 Stress 결과를 바탕으로 포화 처리량의 30~50%를 최소 60분 유지한다. 고정된 임의 RPS를 모든 환경에 동일하게 적용하지 않는다.
 
 확인 대상:
 
@@ -1134,9 +1457,26 @@ DB Connection
 Kafka Lag
 ```
 
+모든 k6 Script에는 HTTP 실패율, API별 p95, Dropped Iteration Threshold를 명시한다. 결과 원본, 요약, Grafana Screenshot과 환경 정보를 `docs/performance/`의 동일한 Test Run ID 아래 저장한다.
+
 ---
 
 # 26. Failure Scenario
+
+각 장애 실험 문서에는 다음을 먼저 작성한다.
+
+```text
+Steady State와 정상 범위
+실험 가설
+장애 주입 방법과 대상
+예상 사용자 영향
+관측할 Metric / Log / Alert
+실험 중단 조건
+복구 명령과 담당 단계
+실제 결과
+```
+
+장애 주입 전에 복구 절차를 검증하고, 동시에 하나의 Failure만 주입한다.
 
 ## Scenario 1. API Pod 부족
 
@@ -1152,6 +1492,15 @@ p95 증가
 
 HPA 적용 전후 비교.
 
+확인 항목:
+
+```text
+Scale Out 시작까지 걸린 시간
+새 Pod가 Ready가 될 때까지의 시간
+최대 Replica와 Resource Saturation
+Scale In 후 정상 상태 복귀
+```
+
 ---
 
 ## Scenario 2. Redis 장애
@@ -1159,7 +1508,7 @@ HPA 적용 전후 비교.
 ```text
 Redis Down
  ↓
-Cache Miss
+Redis Timeout / Connection Failure
  ↓
 PostgreSQL 요청 증가
  ↓
@@ -1177,6 +1526,8 @@ Connection
 DB Load
 ```
 
+Redis 장애를 Cache Miss로 기록하지 않는다. 짧은 Timeout과 PostgreSQL Fallback이 동작하는지, Fallback 때문에 DB가 포화되지 않는지, Redis 복구 후 Cache가 정상적으로 다시 채워지는지 검증한다.
+
 ---
 
 ## Scenario 3. DB Connection Pool 고갈
@@ -1193,6 +1544,8 @@ Pending 증가
 Latency 증가
 ```
 
+Pool Size만 키워서 해결하지 않는다. DB 최대 Connection, Pod 수, Pod별 Pool Size의 관계를 기록하고 Timeout, Query 개선, 요청 제한 중 어떤 조치가 효과가 있었는지 비교한다.
+
 ---
 
 ## Scenario 4. Kafka Consumer 장애
@@ -1207,6 +1560,16 @@ Processing Delay
 
 Worker 복구 및 KEDA Scaling을 검증한다.
 
+확인 항목:
+
+```text
+Consumer 중단 중 API의 202 접수 지속 여부
+Kafka Lag와 Oldest Message Age
+Worker 복구 후 중복 성공 0건
+Lag 해소 시간
+Retry 소진과 DLQ 동작
+```
+
 ---
 
 ## Scenario 5. Bad Deployment
@@ -1220,9 +1583,22 @@ v2 Deploy
  ↓
 Prometheus Alert
  ↓
-ArgoCD Rollback
+Git에서 v2 Manifest Revert
+ ↓
+ArgoCD Sync
  ↓
 v1 복구
+```
+
+기본 복구 방식은 Git Revert 후 ArgoCD Sync이다. ArgoCD가 Prometheus Alert만으로 자동 Rollback한다고 가정하지 않는다. 향후 자동 Rollback Controller 또는 Progressive Delivery 도구를 실제로 구성하고 검증한 경우에만 자동 복구로 문서화한다.
+
+다음 시간을 각각 기록한다.
+
+```text
+배포부터 장애 발생까지
+장애부터 Alert까지(MTTD)
+Alert부터 Revert Commit까지
+Revert부터 정상화까지(MTTR)
 ```
 
 ---
@@ -1291,7 +1667,31 @@ Maven Build
 Docker Image Build
  ↓
 Container Registry Push
+ ↓
+Kubernetes Manifest의 Image Digest 변경 PR 생성
+ ↓
+Review / Merge
+ ↓
+ArgoCD Sync
 ```
+
+Container Image에는 `latest`를 사용하지 않는다. Git Commit SHA Tag와 Image Digest를 기록하며 Kubernetes Manifest는 가능하면 Digest로 고정한다.
+
+GitHub Actions와 ArgoCD의 책임:
+
+```text
+GitHub Actions
+- Test / Build / Image Scan
+- ECR Push
+- 배포 Manifest 변경 PR 생성
+
+ArgoCD
+- Git에 Merge된 Desired State 감지
+- Kubernetes Sync
+- Drift 표시
+```
+
+같은 Repository의 `infrastructure/kubernetes/environments/dev/`를 GitOps Source로 사용한다. CI가 Cluster에 직접 `kubectl apply`하지 않는다. AWS ECR 인증에는 장기 Access Key 대신 GitHub OIDC를 사용한다.
 
 Spring Boot Build 명령:
 
@@ -1405,6 +1805,8 @@ ArgoCD
 = CD / GitOps
 ```
 
+배포 이력은 Git Commit으로 추적한다. Bad Deployment의 기본 Rollback은 이전 정상 Image Digest로 Manifest를 Git Revert하는 방식이다. ArgoCD UI에서만 Live State를 변경하지 않는다.
+
 ---
 
 # 33. Terraform
@@ -1471,6 +1873,8 @@ terraform destroy
 
 비용 절감을 위해 PostgreSQL과 Redis를 Kubernetes 내부에서 운영할 수 있다.
 
+이 경우 데이터 계층의 고가용성, 자동 Backup, Multi-AZ 복구를 검증 범위에서 제외하고 결과 문서에 명시한다.
+
 프로젝트 목표 AWS 비용:
 
 ```text
@@ -1478,6 +1882,19 @@ terraform destroy
 ```
 
 비용 또한 프로젝트의 하나의 운영 지표로 관리한다.
+
+AWS 검증 전 다음을 작성한다.
+
+```text
+예상 실행 시간과 종료 시각
+Terraform Plan Resource 목록
+EKS / EC2 / ALB / NAT / EBS / Data Transfer 예상 비용
+Cost Allocation Tag
+AWS Budget Alert
+Terraform Destroy Checklist
+```
+
+검증 후 Terraform State와 AWS Console을 함께 확인하여 잔존 Resource가 없는지 점검한다. 목표 비용은 보장 수치가 아니라 실제 청구 내역과 차이를 분석하는 예산 상한으로 사용한다.
 
 ---
 
@@ -1514,18 +1931,21 @@ fanpulse/
 │
 ├── docs/
 │   ├── architecture/
+│   ├── api/
 │   ├── incidents/
-│   └── performance/
+│   ├── performance/
+│   ├── runbooks/
+│   └── FanPulse 프로젝트 기획서.md
 │
 ├── .github/
 │   └── workflows/
 │
 ├── docker-compose.yml
 ├── README.md
-├── AGENTS.md
-└── docs/
-    └── PROJECT_SPEC.md
+└── AGENTS.md
 ```
+
+이 문서의 Canonical 경로는 `docs/FanPulse 프로젝트 기획서.md`이다. 다른 이름의 사본을 별도 기준 문서로 운영하지 않는다.
 
 구현 과정에서 디렉터리 구조를 과도하게 미리 생성하지 않는다.
 
@@ -1572,25 +1992,32 @@ PostgreSQL
 Modular Monolith
 ```
 
-구현:
+Phase 1은 한 번에 구현하지 않고 다음 두 Milestone으로 분리한다.
 
-- Maven 프로젝트
-- Maven Wrapper
-- Event
-- Vote
-- Claim
-- Ranking 기본 구조
-- PostgreSQL
-- Flyway
-- Event 목록
-- Event 상세
-- Vote
-- Claim
-- Validation
-- Exception Handling
-- Seed Data
-- Test
-- Actuator
+### Phase 1A — Event Read MVP
+
+```text
+Maven Project / Wrapper
+Event Domain
+PostgreSQL / Flyway
+Event 목록 / 상세
+시간 기반 Event Status 계산
+Validation / Exception Handling
+Seed Data / Test / Actuator
+```
+
+### Phase 1B — Participation MVP
+
+```text
+Candidate
+Vote와 중복 방지
+EventInventory
+동기 Claim과 수량 초과 방지
+PostgreSQL 집계 기반 Ranking
+동시성 Integration Test
+```
+
+Phase 1B의 PostgreSQL Ranking 결과를 Phase 2 Redis Ranking 도입 전 Baseline으로 사용한다.
 
 ---
 
@@ -1598,8 +2025,10 @@ Modular Monolith
 
 ```text
 Event Cache
-Ranking
-Cache Hit / Miss
+Redis Sorted Set Ranking Projection
+PostgreSQL 기반 Ranking과 결과 일치 검증
+Cache Hit / Miss / Timeout
+Cache 및 Ranking 재구축 Runbook
 Redis Failure Test
 ```
 
@@ -1691,9 +2120,25 @@ Claim 처리를 비동기 구조로 변경한다.
 ```text
 Event API
  ↓
+Claim + Outbox 저장
+ ↓
+Outbox Publisher
+ ↓
 Kafka
  ↓
 Claim Worker
+```
+
+구현:
+
+```text
+202 Accepted와 Claim 상태 조회 API
+Idempotency-Key
+Transactional Outbox
+at-least-once Consumer
+Worker 멱등성
+Retry / DLQ
+동기 Claim 대비 Before / After
 ```
 
 이 Phase에서 필요하면 Maven Multi-Module 구조를 도입한다.
@@ -1753,6 +2198,23 @@ AWS 환경에서 최종 검증한다.
 terraform destroy
 ```
 
+## Phase 전환 공통 조건
+
+다음 조건을 만족하기 전에는 다음 Phase로 넘어가지 않는다.
+
+```text
+현재 Phase 기능과 이전 Phase Regression Test 통과
+./mvnw clean verify 성공
+Local 재현 명령 검증
+새로운 환경 변수와 Secret 문서화
+관측 가능한 Metric / Log 확인
+실패 시 원상 복구 절차 확인
+README와 Canonical 기획서 동기화
+실제 측정이 필요한 Phase는 Raw Result와 환경 정보 저장
+```
+
+각 Phase에서 새로운 기술을 도입할 때는 `문제 → 가설 → 변경 → 측정 → 결론`을 `docs/performance/` 또는 `docs/architecture/`에 기록한다.
+
 ---
 
 # 38. Ranking Service 분리 검토
@@ -1777,7 +2239,7 @@ Event API 장애와 Ranking 장애를 격리할 필요
 
 # 39. Codex 최초 작업 범위
 
-Codex의 첫 작업에서는 **Phase 1의 첫 번째 Milestone만 구현한다.**
+Codex의 첫 작업에서는 **Phase 1A — Event Read MVP만 구현한다.**
 
 아직 다음 기술을 구현하지 않는다.
 
@@ -1860,19 +2322,15 @@ com.fanpulse
 │   ├── infrastructure
 │   └── presentation
 │
-├── vote
-├── claim
-├── ranking
-│
 └── common
     ├── config
     ├── exception
     └── response
 ```
 
-첫 번째 Milestone에서는 Event Domain 구현에 집중한다.
+Phase 1A에서는 Event Domain 구현에 집중한다.
 
-나머지 Domain은 필요 이상의 빈 Class를 생성하지 않는다.
+`vote`, `claim`, `ranking` Package와 빈 Class를 미리 생성하지 않는다. 해당 Package는 Phase 1B에서 실제 구현과 함께 추가한다.
 
 ---
 
@@ -1885,12 +2343,13 @@ id
 title
 description
 category
-status
 startAt
 endAt
 createdAt
 updatedAt
 ```
+
+`status`는 Entity Field나 Database Column으로 저장하지 않는다. Domain Method가 주입된 `Clock`의 현재 시각과 `startAt`, `endAt`을 비교하여 계산한다. 테스트에서 System Time에 직접 의존하지 않도록 고정된 `Clock`을 사용한다.
 
 Category:
 
@@ -1913,10 +2372,10 @@ CLOSED
 
 # 42. 최초 API
 
-첫 번째 Milestone에서는 다음 API만 우선 구현한다.
+Phase 1A에서는 다음 API만 우선 구현한다.
 
 ```http
-GET /api/v1/events
+GET /api/v1/events?page=0&size=20&category=GAME&status=OPEN
 ```
 
 ```http
@@ -1926,6 +2385,40 @@ GET /api/v1/events/{id}
 Entity를 직접 반환하지 않는다.
 
 Response DTO를 사용한다.
+
+Query Parameter:
+
+```text
+page      기본 0
+size      기본 20, 최대 100
+category  선택
+status    선택, 조회 시각 기준 계산
+```
+
+기본 정렬은 `startAt ASC, id ASC`이다.
+
+목록 응답에는 다음 정보를 포함한다.
+
+```text
+content
+page
+size
+totalElements
+totalPages
+```
+
+상세 응답에는 `id`, `title`, `description`, `category`, 계산된 `status`, `startAt`, `endAt`을 포함한다. 존재하지 않는 Event는 `404 Not Found`로 응답한다.
+
+공통 오류 응답:
+
+```json
+{
+  "code": "EVENT_NOT_FOUND",
+  "message": "Event not found",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "traceId": "..."
+}
+```
 
 ---
 
@@ -1939,13 +2432,23 @@ Database Schema는 Flyway로 관리한다.
 
 JPA 자동 Schema 생성 기능을 Production 방식처럼 사용하지 않는다.
 
-권장:
+설정:
 
 ```text
 ddl-auto=validate
 ```
 
-또는 해당 Phase에 적절한 안전한 설정을 사용한다.
+Application 실행 시 Hibernate가 Table을 생성하거나 변경하지 않는다. Migration과 Entity Mapping이 다르면 시작 또는 Integration Test가 실패해야 한다.
+
+시간 Column은 PostgreSQL `timestamptz`를 사용하고 Application의 기본 저장 기준은 UTC로 통일한다.
+
+환경별 설정:
+
+```text
+local  Docker Compose PostgreSQL
+test   Testcontainers PostgreSQL
+prod   환경 변수로 주입된 PostgreSQL
+```
 
 ---
 
@@ -1963,6 +2466,8 @@ MUSIC
 ```
 
 Seed Data가 테스트 실행 시 중복 생성되지 않도록 한다.
+
+Seed Data는 고정 ID를 가진 Flyway Migration으로 한 번만 생성한다. Test는 현재 시각에 따라 바뀔 수 있는 Seed Event의 상태를 가정하지 않고, 고정된 `Clock`과 Test Data를 직접 사용한다.
 
 ---
 
@@ -2000,9 +2505,9 @@ Event Repository Integration Test
 Event Controller Test
 ```
 
-가능하다면 PostgreSQL Integration Test에는 Testcontainers를 사용한다.
+Event Domain Test는 `startAt`, `endAt` 경계 시각과 `startAt < endAt` Validation을 포함한다. Controller Test는 Pagination, Filter, 404와 Entity 비노출을 검증한다.
 
-단, Testcontainers 도입 때문에 첫 번째 Milestone이 불필요하게 복잡해질 경우 이후에 추가할 수 있다.
+Event Repository Integration Test에는 PostgreSQL Testcontainers를 사용한다. H2로 PostgreSQL과 Flyway의 호환성을 대신 검증하지 않는다. `./mvnw clean verify` 실행 환경에는 Docker가 필요하며 README와 CI에 이를 명시한다.
 
 ---
 
@@ -2054,7 +2559,7 @@ docker compose up -d
 
 ---
 
-# 49. Phase 1 첫 번째 Milestone 완료 조건
+# 49. Phase 1A — Event Read MVP 완료 조건
 
 ```text
 [ ] Java 21 사용
@@ -2075,15 +2580,23 @@ docker compose up -d
 
 [ ] Event Seed Data 생성
 
-[ ] GET /api/v1/events 정상 동작
+[ ] GET /api/v1/events Pagination / Filter 정상 동작
 
 [ ] GET /api/v1/events/{id} 정상 동작
 
+[ ] Event Status가 startAt / endAt 기준으로 계산됨
+
+[ ] 시간 경계 Test가 고정 Clock으로 통과
+
 [ ] Entity 직접 노출 없음
+
+[ ] 공통 오류 응답과 404 동작
 
 [ ] /actuator/health = UP
 
 [ ] Maven Test 통과
+
+[ ] PostgreSQL Testcontainers Integration Test 통과
 
 [ ] ./mvnw clean verify 성공
 
@@ -2096,6 +2609,8 @@ docker compose up -d
 [ ] 불필요한 Microservice 없음
 
 [ ] Redis / Kafka / Kubernetes를 아직 추가하지 않음
+
+[ ] vote / claim / ranking 빈 Package를 미리 생성하지 않음
 ```
 
 ---
@@ -2105,7 +2620,7 @@ docker compose up -d
 Codex는 다음 지침을 반드시 지킨다.
 
 ```text
-PROJECT_SPEC.md의 현재 Phase 범위만 작업한다.
+docs/FanPulse 프로젝트 기획서.md의 현재 Phase 범위만 작업한다.
 
 명시적으로 요청되지 않은 다음 Phase 작업을 선행하지 않는다.
 
@@ -2117,7 +2632,7 @@ Microservice를 임의로 생성하지 않는다.
 
 작업 완료 후 실행한 Test와 결과를 요약한다.
 
-구현 과정에서 PROJECT_SPEC.md와 충돌하는 판단이 필요한 경우,
+구현 과정에서 Canonical 기획서와 충돌하는 판단이 필요한 경우,
 기존 구조를 임의로 변경하지 말고 변경 이유를 명확히 기록한다.
 ```
 
