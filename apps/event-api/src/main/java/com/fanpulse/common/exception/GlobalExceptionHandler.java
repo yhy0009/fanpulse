@@ -2,13 +2,19 @@ package com.fanpulse.common.exception;
 
 import com.fanpulse.common.config.TraceIdFilter;
 import com.fanpulse.common.response.ApiErrorResponse;
+import com.fanpulse.event.application.CandidateNotFoundException;
 import com.fanpulse.event.application.EventNotFoundException;
+import com.fanpulse.vote.application.EventNotOpenException;
+import com.fanpulse.vote.domain.DuplicateVoteException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -37,11 +43,38 @@ public class GlobalExceptionHandler {
         return response(HttpStatus.NOT_FOUND, "EVENT_NOT_FOUND", exception.getMessage(), request);
     }
 
+    @ExceptionHandler(CandidateNotFoundException.class)
+    ResponseEntity<ApiErrorResponse> handleCandidateNotFound(
+            CandidateNotFoundException exception,
+            HttpServletRequest request
+    ) {
+        return response(HttpStatus.NOT_FOUND, "CANDIDATE_NOT_FOUND", exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(EventNotOpenException.class)
+    ResponseEntity<ApiErrorResponse> handleEventNotOpen(
+            EventNotOpenException exception,
+            HttpServletRequest request
+    ) {
+        return response(HttpStatus.CONFLICT, "EVENT_NOT_OPEN", exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(DuplicateVoteException.class)
+    ResponseEntity<ApiErrorResponse> handleDuplicateVote(
+            DuplicateVoteException exception,
+            HttpServletRequest request
+    ) {
+        return response(HttpStatus.CONFLICT, "DUPLICATE_VOTE", exception.getMessage(), request);
+    }
+
     @ExceptionHandler({
             HandlerMethodValidationException.class,
             ConstraintViolationException.class,
             MethodArgumentTypeMismatchException.class,
-            MissingServletRequestParameterException.class
+            MissingServletRequestParameterException.class,
+            MissingRequestHeaderException.class,
+            MethodArgumentNotValidException.class,
+            HttpMessageNotReadableException.class
     })
     ResponseEntity<ApiErrorResponse> handleInvalidRequest(Exception exception, HttpServletRequest request) {
         return response(HttpStatus.BAD_REQUEST, "INVALID_REQUEST", "Invalid request", request);

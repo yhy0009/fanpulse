@@ -5,6 +5,7 @@ import com.fanpulse.event.domain.Category;
 import com.fanpulse.event.domain.EventStatus;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 
 public record EventDetailResponse(
         Long id,
@@ -13,7 +14,8 @@ public record EventDetailResponse(
         Category category,
         EventStatus status,
         OffsetDateTime startAt,
-        OffsetDateTime endAt
+        OffsetDateTime endAt,
+        List<CandidateSummaryResponse> candidates
 ) {
     static EventDetailResponse from(EventDetailResult result) {
         return new EventDetailResponse(
@@ -23,7 +25,10 @@ public record EventDetailResponse(
                 result.category(),
                 result.status(),
                 result.startAt(),
-                result.endAt()
+                result.endAt(),
+                result.candidates().stream()
+                        .map(CandidateSummaryResponse::from)
+                        .toList()
         );
     }
 }

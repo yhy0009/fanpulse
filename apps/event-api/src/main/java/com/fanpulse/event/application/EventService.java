@@ -1,6 +1,7 @@
 package com.fanpulse.event.application;
 
 import com.fanpulse.event.domain.Category;
+import com.fanpulse.event.domain.CandidateRepository;
 import com.fanpulse.event.domain.EventRepository;
 import com.fanpulse.event.domain.EventStatus;
 import org.springframework.data.domain.PageRequest;
@@ -21,10 +22,16 @@ public class EventService {
     );
 
     private final EventRepository eventRepository;
+    private final CandidateRepository candidateRepository;
     private final Clock clock;
 
-    public EventService(EventRepository eventRepository, Clock clock) {
+    public EventService(
+            EventRepository eventRepository,
+            CandidateRepository candidateRepository,
+            Clock clock
+    ) {
         this.eventRepository = eventRepository;
+        this.candidateRepository = candidateRepository;
         this.clock = clock;
     }
 
@@ -59,6 +66,9 @@ public class EventService {
     public EventDetailResult findEvent(Long id) {
         var event = eventRepository.findById(id)
                 .orElseThrow(() -> new EventNotFoundException(id));
-        return EventDetailResult.from(event, clock);
+        var candidates = candidateRepository.findAllByEventIdOrderByDisplayOrderAscIdAsc(id).stream()
+                .map(CandidateSummaryResult::from)
+                .toList();
+        return EventDetailResult.from(event, clock, candidates);
     }
 }

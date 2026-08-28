@@ -4,8 +4,10 @@ import com.fanpulse.common.config.TraceIdFilter;
 import com.fanpulse.common.exception.GlobalExceptionHandler;
 import com.fanpulse.event.application.EventService;
 import com.fanpulse.event.domain.Category;
+import com.fanpulse.event.domain.Candidate;
 import com.fanpulse.event.domain.Event;
 import com.fanpulse.event.domain.EventStatus;
+import com.fanpulse.support.StubCandidateRepository;
 import com.fanpulse.support.StubEventRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,9 +53,13 @@ class EventControllerTest {
     @Autowired
     private StubEventRepository eventRepository;
 
+    @Autowired
+    private StubCandidateRepository candidateRepository;
+
     @BeforeEach
     void setUp() {
         eventRepository.clear();
+        candidateRepository.clear();
     }
 
     @Test
@@ -101,12 +107,16 @@ class EventControllerTest {
     @Test
     void returnsEventDetail() throws Exception {
         eventRepository.put(1L, event(1L, Category.MOVIE));
+        candidateRepository.put(1L, candidate(1L, 1L, "Moonlight Avenue", 1));
 
         mockMvc.perform(get("/api/v1/events/1"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(1))
                 .andExpect(jsonPath("$.description").value("Description"))
                 .andExpect(jsonPath("$.status").value("OPEN"))
+                .andExpect(jsonPath("$.candidates[0].id").value(1))
+                .andExpect(jsonPath("$.candidates[0].name").value("Moonlight Avenue"))
+                .andExpect(jsonPath("$.candidates[0].displayOrder").value(1))
                 .andExpect(jsonPath("$.createdAt").doesNotExist())
                 .andExpect(jsonPath("$.updatedAt").doesNotExist());
     }
@@ -141,12 +151,23 @@ class EventControllerTest {
         return event;
     }
 
+    private Candidate candidate(Long id, Long eventId, String name, int displayOrder) {
+        Candidate candidate = Candidate.create(eventId, name, displayOrder, FIXED_CLOCK);
+        ReflectionTestUtils.setField(candidate, "id", id);
+        return candidate;
+    }
+
     @TestConfiguration
     static class TestConfig {
 
         @Bean
         StubEventRepository eventRepository() {
             return new StubEventRepository();
+        }
+
+        @Bean
+        StubCandidateRepository candidateRepository() {
+            return new StubCandidateRepository();
         }
 
         @Bean
