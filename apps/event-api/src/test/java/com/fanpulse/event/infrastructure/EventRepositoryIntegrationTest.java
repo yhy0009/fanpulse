@@ -1,6 +1,7 @@
 package com.fanpulse.event.infrastructure;
 
 import com.fanpulse.event.domain.Category;
+import com.fanpulse.event.domain.Candidate;
 import com.fanpulse.event.domain.Event;
 import com.fanpulse.event.domain.EventStatus;
 import com.fanpulse.support.PostgresIntegrationTestSupport;
@@ -25,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DataJpaTest
 @ActiveProfiles("test")
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import(EventRepositoryAdapter.class)
+@Import({EventRepositoryAdapter.class, CandidateRepositoryAdapter.class})
 class EventRepositoryIntegrationTest extends PostgresIntegrationTestSupport {
 
     private static final Instant NOW = Instant.parse("2026-01-01T00:00:00Z");
@@ -36,11 +37,16 @@ class EventRepositoryIntegrationTest extends PostgresIntegrationTestSupport {
     private EventRepositoryAdapter eventRepository;
 
     @Autowired
+    private CandidateRepositoryAdapter candidateRepository;
+
+    @Autowired
     private EntityManager entityManager;
 
     @BeforeEach
     void clearSeedData() {
-        entityManager.createNativeQuery("TRUNCATE TABLE events RESTART IDENTITY").executeUpdate();
+        entityManager.createNativeQuery(
+                "TRUNCATE TABLE votes, candidates, events RESTART IDENTITY CASCADE"
+        ).executeUpdate();
     }
 
     @Test
@@ -74,6 +80,23 @@ class EventRepositoryIntegrationTest extends PostgresIntegrationTestSupport {
         assertThat(result.getContent())
                 .extracting(Event::getTitle)
                 .containsExactly("Earlier First", "Earlier Second", "Later");
+    }
+
+    @Test
+    void findsCandidatesInDisplayOrderThenIdOrder() {
+        Event event = event("Candidate Event", Category.GAME, "2025-12-31T00:00:00Z", "2026-01-02T00:00:00Z");
+        entityManager.persist(event);
+        entityManager.flush();
+        entityManager.persist(Candidate.create(event.getId(), "Second", 2, CLOCK));
+        entityManager.persist(Candidate.create(event.getId(), "First A", 1, CLOCK));
+        entityManager.persist(Candidate.create(event.getId(), "First B", 1, CLOCK));
+        entityManager.flush();
+
+        var result = candidateRepository.findAllByEventIdOrderByDisplayOrderAscIdAsc(event.getId());
+
+        assertThat(result)
+                .extracting(Candidate::getName)
+                .containsExactly("First A", "First B", "Second");
     }
 
     private Event event(String title, Category category, String startAt, String endAt) {

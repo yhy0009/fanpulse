@@ -1,8 +1,10 @@
 package com.fanpulse.event.application;
 
 import com.fanpulse.event.domain.Category;
+import com.fanpulse.event.domain.Candidate;
 import com.fanpulse.event.domain.Event;
 import com.fanpulse.event.domain.EventStatus;
+import com.fanpulse.support.StubCandidateRepository;
 import com.fanpulse.support.StubEventRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -25,12 +27,14 @@ class EventServiceTest {
     private static final Clock FIXED_CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
 
     private StubEventRepository eventRepository;
+    private StubCandidateRepository candidateRepository;
     private EventService eventService;
 
     @BeforeEach
     void setUp() {
         eventRepository = new StubEventRepository();
-        eventService = new EventService(eventRepository, FIXED_CLOCK);
+        candidateRepository = new StubCandidateRepository();
+        eventService = new EventService(eventRepository, candidateRepository, FIXED_CLOCK);
     }
 
     @Test
@@ -58,12 +62,17 @@ class EventServiceTest {
     @Test
     void returnsEventDetail() {
         eventRepository.put(10L, event(10L));
+        candidateRepository.put(2L, candidate(2L, 10L, "Second", 2));
+        candidateRepository.put(1L, candidate(1L, 10L, "First", 1));
 
         EventDetailResult result = eventService.findEvent(10L);
 
         assertThat(result.id()).isEqualTo(10L);
         assertThat(result.description()).isEqualTo("Description");
         assertThat(result.status()).isEqualTo(EventStatus.OPEN);
+        assertThat(result.candidates())
+                .extracting(CandidateSummaryResult::name)
+                .containsExactly("First", "Second");
     }
 
     @Test
@@ -84,5 +93,11 @@ class EventServiceTest {
         );
         ReflectionTestUtils.setField(event, "id", id);
         return event;
+    }
+
+    private Candidate candidate(Long id, Long eventId, String name, int displayOrder) {
+        Candidate candidate = Candidate.create(eventId, name, displayOrder, FIXED_CLOCK);
+        ReflectionTestUtils.setField(candidate, "id", id);
+        return candidate;
     }
 }

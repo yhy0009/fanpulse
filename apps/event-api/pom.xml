@@ -15,7 +15,7 @@
     <artifactId>event-api</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>FanPulse Event API</name>
-    <description>FanPulse event read API</description>
+    <description>FanPulse event participation API</description>
 
     <properties>
         <java.version>21</java.version>
